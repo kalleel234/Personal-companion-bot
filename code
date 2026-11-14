@@ -1,0 +1,2128 @@
+// ============================================================
+//  SHURI  -  personal pet robot
+//  Wemos D1 mini (ESP8266) + 0.96" SSD1306 I2C OLED + TTP223 touch
+// ============================================================
+//
+//  TOUCH
+//    1 tap ........ NORMAL face, normal smile
+//    2 taps ....... VERY HAPPY (^ ^ eyes, blush, big open smile)
+//    3 taps ....... SAD   (droopy lids, tears, trembling frown)
+//    4 taps ....... ANGRY (frowning lids, gritted teeth)
+//    6 taps ....... SETUP MENU (same as holding 10 sec)
+//                   every face lasts 5 sec, then back to the normal smile
+//    hold 5 sec ... TIME & DATE, then after 5 sec automatically
+//                   TEMPERATURE + HUMIDITY with your location at the bottom
+//                   (tap = next page)
+//    hold 10 sec .. SETUP MENU: shows the Wi-Fi she is connected to
+//                   (tap = back, hold 3 sec = change Wi-Fi)
+//
+//  LOCATION (for the weather)
+//    Without help Shuri only gets a rough guess from the internet
+//    connection, and that is often a different city. Set the real place
+//    from her phone page: type the town name (for example Karaikudi) and
+//    pick it from the list. It is saved and used from then on.
+//    The "Use my phone's location" button shows "Turn on your mobile
+//    location" and asks the phone for GPS. Most phone browsers only share
+//    GPS with https pages, so if it is refused, type the town instead.
+//
+//  BLUETOOTH
+//    The Wemos D1 mini (ESP8266) has no Bluetooth radio, so the phone
+//    link is Wi-Fi only. The setup menu says so on its BT line.
+//
+//  PHONE (Wi-Fi)
+//    First boot : Shuri opens Wi-Fi "Shuri-Setup" (password 12345678).
+//                 Join it on your phone - the setup page pops up by
+//                 itself (or open http://192.168.4.1). Pick your Wi-Fi
+//                 (home router or your phone's hotspot) and save.
+//    After that : Shuri shows her address on screen at boot, e.g.
+//                 http://192.168.1.23  (or try http://shuri.local).
+//                 Open it on a phone on the same Wi-Fi to change her
+//                 face and see time and weather.
+//
+//  WIRING
+//    OLED  VCC->3V3  GND->G  SDA->D2  SCL->D1
+//    Touch VCC->3V3  GND->G  SIG->D5   (TTP223, output HIGH on touch)
+//
+//  LIBRARIES (Library Manager)
+//    Adafruit SSD1306, Adafruit GFX, ArduinoJson (v6 or v7)
+//    (RoboEyes is NOT needed - Shuri draws her own eyes.)
+//  BOARD
+//    LOLIN(WEMOS) D1 R2 & mini   (ESP8266 core 3.x)
+// ============================================================
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <DNSServer.h>
+#include <ArduinoJson.h>
+#include <EEPROM.h>
+#include <time.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+
+// ============================================================
+// HARDWARE
+// ============================================================
+
+#define SCREEN_W     128
+#define SCREEN_H     64
+#define OLED_ADDR    0x3C
+#define OLED_SDA     D2
+#define OLED_SCL     D1
+
+#define TOUCH_PIN    D5
+#define TOUCH_ACTIVE HIGH
+
+const uint16_t C_ON  = SSD1306_WHITE;
+const uint16_t C_OFF = SSD1306_BLACK;
+
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+
+
+// ============================================================
+// NAMES / NETWORK
+// ============================================================
+
+const char* HOST_NAME = "shuri";          // http://shuri.local
+const char* AP_NAME   = "Shuri-Setup";
+const char* AP_PASS   = "12345678";       // at least 8 characters
+
+const IPAddress AP_IP(192, 168, 4, 1);
+
+ESP8266WebServer server(80);
+DNSServer dnsServer;
+
+
+// ============================================================
+// TIMINGS
+// ============================================================
+
+const unsigned long FRAME_EYES_MS   = 40;     // ~25 fps
+const unsigned long FRAME_INFO_MS   = 250;
+
+const unsigned long DEBOUNCE_MS     = 25;
+const unsigned long TAP_MAX_MS      = 450;    // longer than this is not a tap
+const unsigned long TAP_WINDOW_MS   = 500;    // wait for more taps
+const unsigned long HOLD_INFO_MS    = 5000;   // hold: time & date, weather
+const unsigned long HOLD_MENU_MS    = 10000;  // hold: setup menu
+const unsigned long MENU_WIFI_HOLD_MS = 3000; // in the menu: change Wi-Fi
+const unsigned long MENU_TIMEOUT_MS = 20000;  // menu closes by itself
+
+const unsigned long MOOD_MS         = 5000;   // every face lasts 5 sec
+
+const unsigned long TIME_PAGE_MS    = 5000;
+const unsigned long WEATHER_PAGE_MS = 5000;
+
+const unsigned long BLINK_MS        = 170;
+const unsigned long BOOP_MS         = 200;
+
+const unsigned long WIFI_BOOT_TIMEOUT_MS = 20000;
+const unsigned long WIFI_RETRY_MS        = 60000;
+const unsigned long WEATHER_EVERY_MS     = 10UL * 60UL * 1000UL;
+const unsigned long WEATHER_RETRY_MS     = 60UL * 1000UL;
+const unsigned long PORTAL_IDLE_MS       = 5UL * 60UL * 1000UL;
+
+
+// ============================================================
+// SAVED CONFIG (EEPROM)
+// ============================================================
+
+const uint32_t CFG_MAGIC = 0x53485231UL;  // "SHR1"
+
+struct Config {
+  uint32_t magic;
+  char ssid[33];
+  char pass[65];
+  uint8_t autoLocation;   // 1 = find location from the internet
+  float lat;
+  float lon;
+  char city[24];
+};
+
+Config cfg;
+bool cfgValid = false;
+
+// Survives ESP.restart(): used to reboot straight into setup mode
+const uint32_t RTC_PORTAL_FLAG = 0xC0FFEE42UL;
+
+
+// ============================================================
+// STATE
+// ============================================================
+
+enum Mood   { MOOD_NORMAL, MOOD_HAPPY, MOOD_SAD, MOOD_ANGRY };
+enum Screen { SCR_EYES, SCR_TIME, SCR_WEATHER, SCR_MENU, SCR_MESSAGE, SCR_PORTAL };
+
+Mood   mood   = MOOD_NORMAL;
+Screen screen = SCR_EYES;
+
+unsigned long moodStart = 0;
+unsigned long moodUntil = 0;
+unsigned long pageStart = 0;
+unsigned long lastFrame = 0;
+
+// Setup menu
+bool menuArmed = false;        // true once the finger was lifted and put back
+bool menuHoldFired = false;
+unsigned long menuLastTouch = 0;
+
+bool portalMode = false;
+unsigned long portalLastActivity = 0;
+unsigned long restartAt = 0;
+
+// Message screen
+String msgTitle, msgLine1, msgLine2, msgLine3;
+unsigned long msgUntil = 0;
+
+// Network
+bool wifiUp = false;
+bool everConnected = false;
+bool mdnsStarted = false;
+bool locationPending = false;
+unsigned long lastWiFiKick = 0;
+unsigned long nextWeatherAt = 0;
+int scanCount = -1;
+
+// Location / time
+float wxLat = 13.0827f;    // default: Chennai
+float wxLon = 80.2707f;
+String cityName = "";
+long utcOffsetSec = 19800; // India, UTC+5:30 (auto-updated online)
+
+// Weather
+bool weatherOk = false;
+float wxTemp = 0, wxHum = 0, wxWind = 0;
+int wxCode = -1;
+bool wxIsDay = true;
+unsigned long wxUpdatedAt = 0;
+
+
+// ============================================================
+// EYE ANIMATION STATE
+// ============================================================
+
+const int LEFT_CX  = 40;
+const int RIGHT_CX = 88;
+const int EYE_CY   = 25;
+const int EYE_W    = 32;
+const int EYE_H    = 32;
+const int EYE_R    = 10;
+const int IRIS_R   = 9;
+const int MOUTH_X  = 64;
+const int MOUTH_Y  = 52;
+
+bool showMouth = true;                    // hidden while searching Wi-Fi at boot
+
+float happyV = 0, sadV = 0, angryV = 0;   // 0..1, eased toward target
+float lookX = 0, lookY = 0;               // -1..1, eased
+float lookTX = 0, lookTY = 0;             // targets
+bool  lookOverride = false;               // true while "searching" at boot
+
+unsigned long nextLookAt = 0;
+unsigned long nextBlinkAt = 2000;
+unsigned long blinkStart = 0;
+bool doubleBlinkPending = false;
+unsigned long boopStart = 0;
+unsigned long wakeStart = 0;
+
+
+// ============================================================
+// TOUCH STATE
+// ============================================================
+
+bool rawLast = false;
+bool touchState = false;
+unsigned long rawChangeAt = 0;
+unsigned long pressStart = 0;
+unsigned long lastRelease = 0;
+bool longFired = false;
+bool setupFired = false;   // 10 sec hold already handled
+int tapCount = 0;
+
+
+// ============================================================
+// FORWARD DECLARATIONS
+// ============================================================
+
+void setMood(Mood m);
+void openInfo();
+void showMessage(const String& title, const String& l1, const String& l2,
+                 const String& l3, unsigned long ms);
+void requestPortal();
+void renderEyes(unsigned long now);
+void onWiFiUp();
+void fetchLocation();
+void updateWeather();
+void saveConfig();
+String jsonEscape(const String& s);
+String placeText();
+int findPlace(const String& query, int count, float& lat, float& lon,
+              String& name, String& listJson);
+String ipString();
+
+
+// ============================================================
+// SMALL HELPERS
+// ============================================================
+
+bool timeReached(unsigned long t) {
+  return (long)(millis() - t) >= 0;
+}
+
+float easeTo(float v, float target, float k) {
+  return v + (target - v) * k;
+}
+
+String fitText(const String& s, unsigned int maxChars) {
+  if (s.length() <= maxChars) return s;
+  return s.substring(0, maxChars - 1) + ".";
+}
+
+void drawCenteredText(const String& text, uint8_t size, int y) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.setTextSize(size);
+  display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_W - (int)w) / 2 - x1, y);
+  display.print(text);
+}
+
+void thickLine(int x0, int y0, int x1, int y1) {
+  display.drawLine(x0, y0, x1, y1, C_ON);
+  display.drawLine(x0 + 1, y0, x1 + 1, y1, C_ON);
+}
+
+void drawHeart(int x, int y) {
+  display.fillCircle(x - 2, y, 2, C_ON);
+  display.fillCircle(x + 2, y, 2, C_ON);
+  display.fillTriangle(x - 4, y + 1, x + 4, y + 1, x, y + 5, C_ON);
+}
+
+String jsonEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 4);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if ((uint8_t)c < 0x20) {
+      char buf[7];
+      snprintf(buf, sizeof(buf), "\\u%04x", (uint8_t)c);
+      out += buf;
+    }
+    else out += c;
+  }
+  return out;
+}
+
+String htmlEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '<') out += F("&lt;");
+    else if (c == '>') out += F("&gt;");
+    else if (c == '&') out += F("&amp;");
+    else if (c == '"') out += F("&quot;");
+    else out += c;
+  }
+  return out;
+}
+
+const char* moodName(Mood m) {
+  switch (m) {
+    case MOOD_HAPPY: return "happy";
+    case MOOD_SAD:   return "sad";
+    case MOOD_ANGRY: return "angry";
+    default:         return "normal";
+  }
+}
+
+const char* screenName(Screen s) {
+  switch (s) {
+    case SCR_TIME:    return "time";
+    case SCR_WEATHER: return "weather";
+    case SCR_MENU:    return "setup menu";
+    case SCR_MESSAGE: return "message";
+    case SCR_PORTAL:  return "setup";
+    default:          return "eyes";
+  }
+}
+
+String weatherText(int code) {
+  if (code == 0) return "Clear";
+  if (code == 1) return "Mostly clear";
+  if (code == 2) return "Partly cloudy";
+  if (code == 3) return "Cloudy";
+  if (code == 45 || code == 48) return "Foggy";
+  if (code >= 51 && code <= 57) return "Drizzle";
+  if (code >= 61 && code <= 67) return "Rain";
+  if (code >= 71 && code <= 77) return "Snow";
+  if (code >= 80 && code <= 82) return "Showers";
+  if (code >= 85 && code <= 86) return "Snow showers";
+  if (code >= 95) return "Thunderstorm";
+  return "Unknown";
+}
+
+bool getTimeNow(struct tm& t) {
+  time_t now = time(nullptr);
+  if (now < 1609459200) return false;   // before 2021 = not synced yet
+  localtime_r(&now, &t);
+  return true;
+}
+
+
+// ============================================================
+// CONFIG
+// ============================================================
+
+void setDefaultConfig() {
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.autoLocation = 1;
+  cfg.lat = 13.0827f;
+  cfg.lon = 80.2707f;
+}
+
+void loadConfig() {
+  EEPROM.begin(512);
+  EEPROM.get(0, cfg);
+  EEPROM.end();
+
+  if (cfg.magic != CFG_MAGIC) {
+    setDefaultConfig();
+    cfgValid = false;
+    return;
+  }
+
+  cfg.ssid[sizeof(cfg.ssid) - 1] = 0;
+  cfg.pass[sizeof(cfg.pass) - 1] = 0;
+  cfg.city[sizeof(cfg.city) - 1] = 0;
+
+  if (isnan(cfg.lat) || isnan(cfg.lon) ||
+      cfg.lat < -90 || cfg.lat > 90 || cfg.lon < -180 || cfg.lon > 180) {
+    cfg.lat = 13.0827f;
+    cfg.lon = 80.2707f;
+  }
+
+  cfgValid = cfg.ssid[0] != 0;
+
+  wxLat = cfg.lat;
+  wxLon = cfg.lon;
+  cityName = cfg.city;
+}
+
+void saveConfig() {
+  cfg.magic = CFG_MAGIC;
+  EEPROM.begin(512);
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+  EEPROM.end();
+  Serial.println(F("Config saved."));
+}
+
+bool takePortalFlag() {
+  uint32_t flag = 0;
+  ESP.rtcUserMemoryRead(0, &flag, sizeof(flag));
+  if (flag != RTC_PORTAL_FLAG) return false;
+  flag = 0;
+  ESP.rtcUserMemoryWrite(0, &flag, sizeof(flag));
+  return true;
+}
+
+void requestPortal() {
+  uint32_t flag = RTC_PORTAL_FLAG;
+  ESP.rtcUserMemoryWrite(0, &flag, sizeof(flag));
+  showMessage("Setup", "Opening Wi-Fi", "setup mode...", "", 3000);
+  restartAt = millis() + 1200;
+  Serial.println(F("Restarting into setup mode."));
+}
+
+
+// ============================================================
+// MOODS & SCREENS
+// ============================================================
+
+void setMood(Mood m) {
+  unsigned long now = millis();
+  mood = m;
+  moodStart = now;
+
+  moodUntil = now + MOOD_MS;   // then back to the normal smile
+
+  if (screen != SCR_PORTAL) screen = SCR_EYES;
+
+  Serial.print(F("MOOD: "));
+  Serial.println(moodName(m));
+}
+
+void openInfo() {
+  mood = MOOD_NORMAL;
+  screen = SCR_TIME;
+  pageStart = millis();
+  Serial.println(F("SCREEN: time"));
+}
+
+void openWeather() {
+  mood = MOOD_NORMAL;
+  screen = SCR_WEATHER;
+  pageStart = millis();
+  Serial.println(F("SCREEN: weather"));
+}
+
+void openMenu() {
+  mood = MOOD_NORMAL;
+  screen = SCR_MENU;
+  menuArmed = false;
+  menuHoldFired = false;
+  menuLastTouch = millis();
+  lastFrame = 0;   // draw right away
+  Serial.println(F("SCREEN: setup menu"));
+}
+
+void backToEyes() {
+  screen = SCR_EYES;
+  Serial.println(F("SCREEN: eyes"));
+}
+
+void showMessage(const String& title, const String& l1, const String& l2,
+                 const String& l3, unsigned long ms) {
+  msgTitle = title;
+  msgLine1 = l1;
+  msgLine2 = l2;
+  msgLine3 = l3;
+  msgUntil = millis() + ms;
+  screen = SCR_MESSAGE;
+  lastFrame = 0;   // draw right away
+}
+
+void updateTimers() {
+  if (mood != MOOD_NORMAL && timeReached(moodUntil)) {
+    mood = MOOD_NORMAL;
+    Serial.println(F("MOOD: normal"));
+  }
+
+  if (screen == SCR_TIME && millis() - pageStart >= TIME_PAGE_MS) {
+    openWeather();
+  } else if (screen == SCR_WEATHER && millis() - pageStart >= WEATHER_PAGE_MS) {
+    backToEyes();
+  } else if (screen == SCR_MENU && millis() - menuLastTouch >= MENU_TIMEOUT_MS) {
+    backToEyes();
+  } else if (screen == SCR_MESSAGE && timeReached(msgUntil)) {
+    backToEyes();
+  }
+}
+
+
+// ============================================================
+// TOUCH
+// ============================================================
+
+// Taps on the face
+void onTaps(int n) {
+  Serial.print(F("TAPS: "));
+  Serial.println(n);
+
+  if (n == 1)      setMood(MOOD_NORMAL);   // normal smile
+  else if (n == 2) setMood(MOOD_HAPPY);    // very happy
+  else if (n == 3) setMood(MOOD_SAD);      // emotional sad
+  else if (n <= 5) setMood(MOOD_ANGRY);    // 4 taps (5 counts as 4)
+  else             openMenu();             // 6 taps: setup menu
+}
+
+// A tap on any other screen
+void onPageTap() {
+  if (screen == SCR_TIME) openWeather();   // next page
+  else backToEyes();                       // weather / menu / message
+}
+
+void handleTouch() {
+  if (restartAt != 0) return;   // restarting: ignore the sensor
+
+  unsigned long now = millis();
+  bool raw = digitalRead(TOUCH_PIN) == TOUCH_ACTIVE;
+
+  if (raw != rawLast) {
+    rawLast = raw;
+    rawChangeAt = now;
+  }
+
+  // Debounced edge
+  if (raw != touchState && now - rawChangeAt >= DEBOUNCE_MS) {
+    touchState = raw;
+
+    if (touchState) {
+      pressStart = now;
+      longFired = false;
+      setupFired = false;
+      if (screen == SCR_MENU) menuArmed = true;
+    } else {
+      unsigned long held = now - pressStart;
+
+      if (!longFired && held <= TAP_MAX_MS) {
+        if (screen == SCR_EYES) {
+          tapCount++;
+          lastRelease = now;
+          boopStart = now;            // little squish on every tap
+        } else {
+          tapCount = 0;
+          onPageTap();
+        }
+      } else {
+        tapCount = 0;                 // a hold is not a tap
+      }
+    }
+  }
+
+  // Holding
+  if (touchState) {
+    unsigned long held = now - pressStart;
+
+    if (screen == SCR_MENU) {
+      menuLastTouch = now;
+
+      // menuArmed: the hold that opened the menu does not count
+      if (menuArmed && !menuHoldFired && held >= MENU_WIFI_HOLD_MS) {
+        menuHoldFired = true;
+        requestPortal();
+      }
+    } else {
+      if (!longFired && held >= HOLD_INFO_MS) {
+        longFired = true;
+        tapCount = 0;
+        Serial.println(F("HOLD 5 SEC"));
+        if (screen == SCR_EYES || screen == SCR_MESSAGE) openInfo();
+      }
+
+      if (!setupFired && held >= HOLD_MENU_MS) {
+        setupFired = true;
+        Serial.println(F("HOLD 10 SEC"));
+        openMenu();
+      }
+    }
+  }
+
+  // Tap series finished
+  if (!touchState && tapCount > 0 && now - lastRelease >= TAP_WINDOW_MS) {
+    onTaps(tapCount);
+    tapCount = 0;
+  }
+}
+
+
+// ============================================================
+// EYES
+// ============================================================
+
+float blinkFactor(unsigned long now) {
+  if (blinkStart == 0) {
+    if (!timeReached(nextBlinkAt)) return 1.0f;
+    blinkStart = now;
+  }
+
+  unsigned long e = now - blinkStart;
+
+  if (e >= BLINK_MS) {
+    blinkStart = 0;
+    if (doubleBlinkPending) {
+      doubleBlinkPending = false;
+      nextBlinkAt = now + 130;
+    } else {
+      nextBlinkAt = now + random(2500, 6000);
+      doubleBlinkPending = random(100) < 20;
+    }
+    return 1.0f;
+  }
+
+  float p = e / (float)BLINK_MS;
+  return p < 0.5f ? 1.0f - p * 2.0f : (p - 0.5f) * 2.0f;
+}
+
+void updateLookTarget(unsigned long now) {
+  if (lookOverride) return;
+
+  if (mood == MOOD_SAD)   { lookTX = 0; lookTY = 0.7f; return; }
+  if (mood != MOOD_NORMAL) { lookTX = 0; lookTY = 0;   return; }
+
+  if (!timeReached(nextLookAt)) return;
+
+  if (random(100) < 45) {
+    lookTX = 0;
+    lookTY = 0;
+  } else {
+    const float xs[] = { -1.0f, -0.6f, 0.6f, 1.0f };
+    const float ys[] = { -0.8f, 0.0f, 0.0f, 0.6f };
+    lookTX = xs[random(4)];
+    lookTY = ys[random(4)];
+  }
+
+  nextLookAt = now + random(1200, 3800);
+}
+
+// Female lashes on the outer top corner. side: -1 left eye, +1 right eye
+void drawLashes(int ox, int ty, int side) {
+  thickLine(ox - side * 1, ty + 8, ox + side * 6, ty + 4);
+  thickLine(ox - side * 4, ty + 4, ox + side * 3, ty - 3);
+  thickLine(ox - side * 9, ty + 1, ox - side * 5, ty - 6);
+}
+
+// Lashes sitting on a droopy (sad) lid. The lid rises toward the nose.
+void drawSadLashes(int ox, int oy, int side, int d, int w) {
+  int s3 = 3 * d / w;
+  int s7 = 7 * d / w;
+  thickLine(ox,            oy,      ox + side * 6, oy + 3);
+  thickLine(ox - side * 3, oy - s3, ox + side * 4, oy - s3 - 3);
+  thickLine(ox - side * 7, oy - s7, ox - side * 2, oy - s7 - 6);
+}
+
+// Eyelid edge: a line plus one pixel above it (keeps the iris clean)
+void lidLine(int x0, int y0, int x1, int y1) {
+  display.drawLine(x0, y0, x1, y1, C_ON);
+  display.drawLine(x0, y0 - 1, x1, y1 - 1, C_ON);
+}
+
+void drawClosedEye(int left, int w, int cy, int outerX, int side) {
+  display.fillRoundRect(left + 2, cy - 1, w - 4, 3, 1, C_ON);
+  // sleepy lashes pointing down
+  thickLine(outerX - side * 3, cy + 1, outerX + side * 2, cy + 6);
+  thickLine(outerX - side * 9, cy + 1, outerX - side * 8, cy + 7);
+}
+
+void drawEye(int cx, int cy, int side, float openF, float wScale) {
+  int w = (int)(EYE_W * wScale);
+  int h = (int)(EYE_H * openF);
+
+  int left   = cx - w / 2;
+  int right  = left + w - 1;
+  int outerX = (side < 0) ? left : right;
+  int innerX = (side < 0) ? right : left;
+
+  if (h < 6) {
+    drawClosedEye(left, w, cy, outerX, side);
+    return;
+  }
+
+  int top = cy - h / 2;
+
+  int r = EYE_R;
+  if (r > h / 2 - 1) r = h / 2 - 1;
+  display.fillRoundRect(left, top, w, h, r, C_ON);
+
+  // Iris with sparkles (hidden when smiling)
+  if (happyV < 0.35f) {
+    int ix = cx + (int)(lookX * 4);
+    int iy = cy + 2 + (int)(lookY * 3);
+    display.fillCircle(ix, iy, IRIS_R, C_OFF);
+
+    if (openF > 0.6f) {
+      int big = (sadV > 0.5f) ? 3 : 2;   // glossy, teary eyes when sad
+      display.fillCircle(ix - 3, iy - 3, big, C_ON);
+      display.fillCircle(ix + 3, iy + 4, 1, C_ON);
+    }
+  }
+
+  int innerX2 = innerX - side * 2;   // a bit past the inner edge
+  int outerX2 = outerX + side * 2;   // a bit past the outer edge
+
+  // ANGRY: lids slant down toward the nose
+  if (angryV > 0.02f) {
+    int d = (int)(h * 0.5f * angryV);
+    display.fillTriangle(innerX2, top - 2, outerX2, top - 2, innerX2, top + d, C_OFF);
+    if (angryV > 0.3f) lidLine(innerX, top + d - 1, outerX, top - 1);
+  }
+
+  // SAD: lids droop on the outside
+  int sadD = 0;
+  if (sadV > 0.02f) {
+    sadD = (int)(h * 0.5f * sadV);
+    display.fillTriangle(outerX2, top - 2, innerX2, top - 2, outerX2, top + sadD, C_OFF);
+    if (sadV > 0.3f) lidLine(outerX, top + sadD - 1, innerX, top - 1);
+  }
+
+  // HAPPY: cut the bottom with a big circle -> smiling arch  ^ ^
+  if (happyV > 0.02f) {
+    const int R = 22;
+    int cutTop = top + (int)(h * 0.30f) + (int)((1.0f - happyV) * 40);
+    display.fillCircle(cx, cutTop + R, R, C_OFF);
+  }
+
+  if (sadV > 0.5f) drawSadLashes(outerX, top + sadD - 1, side, sadD, w);
+  else             drawLashes(outerX, top, side);
+}
+
+void drawBlush(int cx, int y, int side) {
+  int bx = cx + side * 4 - 6;
+  for (int i = 0; i < 3; i++) {
+    display.drawLine(bx + i * 5, y + 4, bx + i * 5 + 3, y, C_ON);
+  }
+}
+
+void drawTear(int x, int y) {
+  display.fillCircle(x, y + 3, 2, C_ON);
+  display.fillTriangle(x - 2, y + 3, x + 2, y + 3, x, y - 1, C_ON);
+}
+
+void drawAngerMark() {
+  display.drawLine(119, 1, 119, 5, C_ON);  display.drawLine(119, 5, 115, 5, C_ON);
+  display.drawLine(123, 1, 123, 5, C_ON);  display.drawLine(123, 5, 127, 5, C_ON);
+  display.drawLine(119, 13, 119, 9, C_ON); display.drawLine(119, 9, 115, 9, C_ON);
+  display.drawLine(123, 13, 123, 9, C_ON); display.drawLine(123, 9, 127, 9, C_ON);
+}
+
+// ---------------- MOUTH ----------------
+
+// Smile (depth > 0) or frown (depth < 0), 2 px thick
+void drawMouthCurve(int cx, int cy, int halfW, float depth) {
+  for (int dx = -halfW; dx <= halfW; dx++) {
+    float u = dx / (float)halfW;
+    int y = cy + (int)lroundf(depth * (0.5f - u * u));
+    display.drawFastVLine(cx + dx, y, 2, C_ON);
+  }
+}
+
+// Big open smile: teeth on top, tongue at the bottom
+void drawGrin(int cx, int top, int halfW, int h) {
+  for (int dx = -halfW; dx <= halfW; dx++) {
+    float u = dx / (float)halfW;
+    int len = (int)lroundf(h * sqrtf(1.0f - u * u));
+    if (len < 2) len = 2;
+    display.drawFastVLine(cx + dx, top, len, C_ON);
+  }
+
+  int innerW = halfW - 3;
+  for (int dx = -innerW; dx <= innerW; dx++) {
+    float u = dx / (float)innerW;
+    int len = (int)lroundf((h - 5) * sqrtf(1.0f - u * u));
+    if (len > 0) display.drawFastVLine(cx + dx, top + 3, len, C_OFF);
+  }
+
+  if (h >= 10) display.fillCircle(cx, top + h - 4, 3, C_ON);   // tongue
+}
+
+// Angry: gritted teeth
+void drawGrit(int cx, int cy) {
+  display.fillRoundRect(cx - 12, cy - 4, 25, 9, 3, C_ON);
+  display.drawFastHLine(cx - 10, cy, 21, C_OFF);
+  for (int dx = -6; dx <= 6; dx += 6) {
+    display.drawFastVLine(cx + dx, cy - 3, 7, C_OFF);
+  }
+}
+
+void drawMouth(int cx, int cy, unsigned long now, float boop) {
+  if (happyV > 0.5f) {
+    drawGrin(cx, cy - 6, 14, (int)(13 * happyV));
+  } else if (angryV > 0.5f) {
+    drawGrit(cx, cy + 1);
+  } else {
+    // normal smile; bends into a frown when sad or getting angry
+    float depth = 4.0f - 8.0f * sadV - 7.0f * angryV + 2.0f * boop;
+    int halfW = 10 - (int)(2 * sadV) - (int)(2 * angryV);
+    int wobble = (sadV > 0.7f) ? (int)lroundf(sinf(now * 0.02f)) : 0;   // trembling lip
+    drawMouthCurve(cx + wobble, cy, halfW, depth);
+  }
+}
+
+// Draws the face into the buffer (caller calls display.display())
+void renderEyes(unsigned long now) {
+  updateLookTarget(now);
+
+  happyV = easeTo(happyV, mood == MOOD_HAPPY ? 1.0f : 0.0f, 0.25f);
+  sadV   = easeTo(sadV,   mood == MOOD_SAD   ? 1.0f : 0.0f, 0.20f);
+  angryV = easeTo(angryV, mood == MOOD_ANGRY ? 1.0f : 0.0f, 0.30f);
+  lookX  = easeTo(lookX, lookTX, 0.22f);
+  lookY  = easeTo(lookY, lookTY, 0.22f);
+
+  float openF = blinkFactor(now);
+  float wScale = 1.0f;
+  float boop = 0.0f;
+
+  // Wake-up: eyes open slowly after boot
+  if (wakeStart != 0 && now - wakeStart < 700) {
+    float p = (now - wakeStart) / 700.0f;
+    openF *= p * p;
+  }
+
+  // Boop: squish on every tap
+  if (boopStart != 0 && now - boopStart < BOOP_MS) {
+    float s = sinf((now - boopStart) / (float)BOOP_MS * PI);
+    boop = s;
+    openF  *= 1.0f - 0.2f * s;
+    wScale += 0.08f * s;
+  }
+
+  int ox = (int)(lookX * 6);
+  int oy = (int)(lookY * 3);
+
+  // Happy bounce
+  if (happyV > 0.1f) {
+    oy -= (int)(fabsf(sinf(now * 0.008f)) * 3.0f * happyV);
+  }
+
+  // Angry shake at the start
+  if (mood == MOOD_ANGRY && now - moodStart < 700) {
+    ox += (int)(sinf(now * 0.09f) * 2.0f);
+  }
+
+  display.clearDisplay();
+
+  drawEye(LEFT_CX + ox,  EYE_CY + oy, -1, openF, wScale);
+  drawEye(RIGHT_CX + ox, EYE_CY + oy, +1, openF, wScale);
+
+  if (showMouth) drawMouth(MOUTH_X + ox / 2, MOUTH_Y + oy / 2, now, boop);
+
+  if (happyV > 0.6f) {
+    drawBlush(LEFT_CX + ox,  EYE_CY + 11 + oy, -1);
+    drawBlush(RIGHT_CX + ox, EYE_CY + 11 + oy, +1);
+
+    float phase = (now % 1600) / 1600.0f;
+    drawHeart(64, 38 - (int)(phase * 38));   // floats up between the eyes
+  }
+
+  if (sadV > 0.7f) {
+    int bottom = EYE_CY + oy + EYE_H / 2;
+    drawTear(RIGHT_CX + ox + 11, bottom + (int)((now / 28) % 22));
+    drawTear(LEFT_CX + ox - 11,  bottom + (int)(((now + 300) / 28) % 22));
+  }
+
+  if (angryV > 0.7f && (now / 300) % 2 == 0) {
+    drawAngerMark();
+  }
+}
+
+
+// ============================================================
+// TIME PAGE
+// ============================================================
+
+const char* DAY_NAMES[]   = { "SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY",
+                              "THURSDAY", "FRIDAY", "SATURDAY" };
+const char* MONTH_NAMES[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+void drawTimePage() {
+  display.clearDisplay();
+  display.setTextColor(C_ON);
+
+  struct tm t;
+
+  if (!getTimeNow(t)) {
+    drawCenteredText("TIME", 1, 4);
+    drawCenteredText("Not synced yet", 1, 26);
+    drawCenteredText(wifiUp ? "Asking internet..." : "No Wi-Fi", 1, 40);
+    return;
+  }
+
+  int h12 = t.tm_hour % 12;
+  if (h12 == 0) h12 = 12;
+
+  char hhmm[8];
+  snprintf(hhmm, sizeof(hhmm), (t.tm_sec % 2) ? "%d %02d" : "%d:%02d", h12, t.tm_min);
+  const char* ampm = t.tm_hour < 12 ? "AM" : "PM";
+
+  int16_t x1, y1;
+  uint16_t tw, th;
+  display.setTextSize(3);
+  display.getTextBounds(hhmm, 0, 0, &x1, &y1, &tw, &th);
+
+  int total = tw + 3 + 12;
+  int x0 = (SCREEN_W - total) / 2;
+
+  display.setCursor(x0, 20);
+  display.print(hhmm);
+
+  display.setTextSize(1);
+  display.setCursor(x0 + tw + 3, 20);
+  display.print(ampm);
+
+  drawCenteredText(DAY_NAMES[t.tm_wday], 1, 3);
+
+  char date[20];
+  snprintf(date, sizeof(date), "%d %s %d",
+           t.tm_mday, MONTH_NAMES[t.tm_mon], t.tm_year + 1900);
+  drawCenteredText(date, 1, 53);
+
+  drawHeart(6, 5);
+  drawHeart(121, 5);
+}
+
+
+// ============================================================
+// WEATHER PAGE
+// ============================================================
+
+void drawCloud(int x, int y) {
+  display.fillCircle(x - 7, y + 2, 6, C_ON);
+  display.fillCircle(x + 1, y - 3, 8, C_ON);
+  display.fillCircle(x + 9, y + 2, 6, C_ON);
+  display.fillRect(x - 7, y + 2, 16, 7, C_ON);
+}
+
+void drawSun(int x, int y, int r) {
+  display.fillCircle(x, y, r, C_ON);
+  for (int i = 0; i < 8; i++) {
+    float a = i * PI / 4.0f;
+    display.drawLine(x + cosf(a) * (r + 3), y + sinf(a) * (r + 3),
+                     x + cosf(a) * (r + 7), y + sinf(a) * (r + 7), C_ON);
+  }
+}
+
+void drawMoon(int x, int y) {
+  display.fillCircle(x, y, 9, C_ON);
+  display.fillCircle(x + 5, y - 4, 8, C_OFF);
+}
+
+void drawWeatherIcon(int code, bool isDay, int x, int y) {
+  if (code == 0 || code == 1) {
+    if (isDay) drawSun(x, y, 7); else drawMoon(x, y);
+  } else if (code == 2) {
+    if (isDay) {
+      drawSun(x + 6, y - 6, 5);
+    } else {                                   // small moon above the cloud
+      display.fillCircle(x + 10, y - 9, 5, C_ON);
+      display.fillCircle(x + 13, y - 11, 4, C_OFF);
+    }
+    drawCloud(x - 3, y + 5);
+  } else if (code == 45 || code == 48) {
+    for (int i = 0; i < 4; i++) display.fillRect(x - 13 + (i % 2) * 4, y - 9 + i * 6, 24, 2, C_ON);
+  } else if (code >= 71 && code <= 77) {
+    drawCloud(x, y - 4);
+    for (int i = 0; i < 3; i++) display.fillCircle(x - 8 + i * 8, y + 12, 1, C_ON);
+  } else if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+    drawCloud(x, y - 4);
+    for (int i = 0; i < 4; i++) display.drawLine(x - 10 + i * 6, y + 9, x - 12 + i * 6, y + 14, C_ON);
+  } else if (code >= 95) {
+    drawCloud(x, y - 4);
+    display.fillTriangle(x + 1, y + 6, x - 4, y + 13, x + 1, y + 13, C_ON);
+    display.fillTriangle(x - 1, y + 12, x + 4, y + 12, x - 2, y + 19, C_ON);
+  } else {
+    drawCloud(x, y);
+  }
+}
+
+void drawPin(int x, int y) {
+  display.fillCircle(x, y + 2, 2, C_ON);
+  display.fillTriangle(x - 2, y + 3, x + 2, y + 3, x, y + 7, C_ON);
+  display.drawPixel(x, y + 2, C_OFF);
+}
+
+// Where the weather is for: city name, or the coordinates if unknown
+String placeText() {
+  if (cityName.length()) return cityName;
+  return String(wxLat, 2) + ", " + String(wxLon, 2);
+}
+
+void drawWeatherPage() {
+  display.clearDisplay();
+  display.setTextColor(C_ON);
+
+  if (!weatherOk) {
+    drawCenteredText("WEATHER", 1, 4);
+    drawCenteredText(wifiUp ? "Loading..." : "Offline", 2, 24);
+    drawCenteredText(wifiUp ? "please wait" : "No Wi-Fi", 1, 48);
+    return;
+  }
+
+  drawWeatherIcon(wxCode, wxIsDay, 21, 20);
+
+  // Temperature
+  display.setTextSize(3);
+  display.setCursor(46, 2);
+  display.print((int)lroundf(wxTemp));
+  int cx = display.getCursorX();
+  display.drawCircle(cx + 3, 4, 2, C_ON);
+  display.setTextSize(2);
+  display.setCursor(cx + 8, 2);
+  display.print("C");
+
+  // Sky + humidity
+  display.setTextSize(1);
+  display.setCursor(46, 28);
+  display.print(fitText(weatherText(wxCode), 13));
+
+  display.setCursor(46, 39);
+  display.print("Humidity ");
+  display.print((int)lroundf(wxHum));
+  display.print("%");
+
+  // Location at the bottom
+  display.drawFastHLine(0, 50, SCREEN_W, C_ON);
+
+  String place = fitText(placeText(), wifiUp ? 19 : 13);
+  if (!wifiUp) place += " (old)";   // last reading, Wi-Fi is down
+
+  int textW = place.length() * 6;
+  int x0 = (SCREEN_W - (textW + 9)) / 2;
+  drawPin(x0 + 2, 54);
+  display.setCursor(x0 + 9, 55);
+  display.print(place);
+}
+
+
+// ============================================================
+// MESSAGE & SETUP SCREENS
+// ============================================================
+
+void drawMessagePage() {
+  display.clearDisplay();
+  display.setTextColor(C_ON);
+  drawCenteredText(msgTitle, 2, 0);
+  drawCenteredText(msgLine1, 1, 24);
+  drawCenteredText(msgLine2, 1, 38);
+  drawCenteredText(msgLine3, 1, 52);
+}
+
+// Setup menu: which Wi-Fi Shuri is connected to (and Bluetooth)
+void drawMenuPage() {
+  display.clearDisplay();
+
+  display.fillRect(0, 0, SCREEN_W, 11, C_ON);
+  display.setTextColor(C_OFF);
+  drawCenteredText("SETUP MENU", 1, 2);
+
+  display.setTextColor(C_ON);
+  display.setTextSize(1);
+
+  display.setCursor(0, 14);
+  display.print("WiFi: ");
+  display.print(fitText(cfg.ssid, 15));
+
+  display.setCursor(0, 24);
+  if (wifiUp) {
+    display.print("IP:   ");
+    display.print(ipString());
+  } else {
+    display.print("      not connected");
+  }
+
+  // The ESP8266 chip has no Bluetooth radio
+  display.setCursor(0, 34);
+  display.print("BT:   not on ESP8266");
+
+  display.drawFastHLine(0, 44, SCREEN_W, C_ON);
+
+  display.setCursor(0, 47);
+  display.print("Tap     = go back");
+  display.setCursor(0, 56);
+  display.print("Hold 3s = change WiFi");
+}
+
+void drawPortalPage() {
+  display.clearDisplay();
+
+  display.fillRect(0, 0, SCREEN_W, 11, C_ON);
+  display.setTextColor(C_OFF);
+  drawCenteredText("SHURI WI-FI SETUP", 1, 2);
+
+  display.setTextColor(C_ON);
+  display.setTextSize(1);
+  display.setCursor(0, 13);
+  display.print("1.Join: ");
+  display.print(AP_NAME);
+  display.setCursor(0, 23);
+  display.print("  Pass: ");
+  display.print(AP_PASS);
+  display.setCursor(0, 33);
+  display.print("2.Open 192.168.4.1");
+
+  // How many phones have joined Shuri's own Wi-Fi
+  int phones = WiFi.softAPgetStationNum();
+  if (phones > 0) {
+    drawCenteredText(String("Phones connected: ") + phones, 1, 44);
+  } else {
+    drawCenteredText("No phone joined yet", 1, 44);
+  }
+
+  if (cfgValid) drawCenteredText("hold 3s = cancel", 1, 55);
+  else if ((millis() / 600) % 2) drawHeart(64, 56);
+}
+
+// Thin line along the bottom that fills up while the sensor is held
+void drawHoldBar(unsigned long now) {
+  if (!touchState || screen == SCR_PORTAL || restartAt != 0) return;
+
+  unsigned long held = now - pressStart;
+  unsigned long part = 0, full = HOLD_INFO_MS;
+
+  if (screen == SCR_MENU) {
+    if (!menuArmed || menuHoldFired) return;
+    part = held;                              // 0..3 sec -> change Wi-Fi
+    full = MENU_WIFI_HOLD_MS;
+  } else if (longFired) {
+    part = held - HOLD_INFO_MS;               // 5..10 sec -> setup menu
+    full = HOLD_MENU_MS - HOLD_INFO_MS;
+  } else if (screen == SCR_EYES) {
+    part = held;                              // 0..5 sec -> time & date
+  } else {
+    return;
+  }
+
+  if (held < 600) return;
+  if (part > full) part = full;
+  display.drawFastHLine(0, SCREEN_H - 1, (int)(part * SCREEN_W / full), C_ON);
+}
+
+void renderScreen() {
+  unsigned long now = millis();
+  unsigned long interval = (screen == SCR_EYES) ? FRAME_EYES_MS : FRAME_INFO_MS;
+  if (touchState && interval > 100) interval = 100;   // smooth hold bar
+  if (lastFrame != 0 && now - lastFrame < interval) return;
+  lastFrame = now;
+
+  switch (screen) {
+    case SCR_EYES:    renderEyes(now);   break;
+    case SCR_TIME:    drawTimePage();    break;
+    case SCR_WEATHER: drawWeatherPage(); break;
+    case SCR_MENU:    drawMenuPage();    break;
+    case SCR_MESSAGE: drawMessagePage(); break;
+    case SCR_PORTAL:  drawPortalPage();  break;
+  }
+
+  drawHoldBar(now);
+  display.display();
+}
+
+
+// ============================================================
+// WEB PAGES (stored in flash)
+// ============================================================
+
+const char PAGE_SETUP[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shuri Setup</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;min-height:100vh;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#fff;padding:18px;
+background:radial-gradient(circle at 12% 8%,#ff5fae55,transparent 45%),radial-gradient(circle at 90% 92%,#7a5cff55,transparent 45%),#150b24;display:flex;justify-content:center}
+.w{width:100%;max-width:440px}
+.face{margin:8px auto 6px;width:132px;height:64px;background:#000;border-radius:18px;display:flex;align-items:center;justify-content:center;gap:14px;box-shadow:0 0 0 3px #2b1a44}
+.eye{width:34px;height:38px;background:#fff;border-radius:12px;position:relative;animation:b 4s infinite}
+.eye:after{content:"";position:absolute;width:20px;height:20px;border-radius:50%;background:#000;left:7px;top:11px;box-shadow:inset 5px 5px 0 -2px #fff}
+@keyframes b{0%,92%,100%{transform:scaleY(1)}95%{transform:scaleY(.1)}}
+h1{text-align:center;letter-spacing:10px;margin:10px 0 0;font-size:34px}
+.sub{text-align:center;opacity:.65;margin:4px 0 18px;font-size:14px}
+.card{background:#ffffff12;border:1px solid #ffffff22;border-radius:20px;padding:20px;margin-bottom:14px}
+h2{font-size:15px;margin:0 0 12px;color:#ff9fd0}
+label{display:block;font-size:13px;opacity:.75;margin:12px 0 6px}
+input[type=text],input[type=password],input:not([type]){width:100%;padding:13px;border-radius:12px;border:1px solid #ffffff26;background:#0006;color:#fff;font-size:16px;outline:none}
+input:focus{border-color:#ff7ac0}
+.nets{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto;font-size:14px;opacity:.9}
+.net{display:flex;justify-content:space-between;padding:11px 13px;border-radius:12px;border:1px solid #ffffff1c;background:#ffffff0d;color:#fff;font-size:15px;text-align:left}
+.net:active,.net.sel{background:#ff5fae40;border-color:#ff7ac0}
+.link{background:none;border:none;color:#ff9fd0;padding:8px 0;font-size:14px}
+.pw{display:flex;gap:8px}.pw button{border:none;border-radius:12px;background:#ffffff1c;color:#fff;padding:0 14px}
+.chk{display:flex;gap:10px;align-items:center;opacity:1;font-size:14px}
+.chk input{width:20px;height:20px;accent-color:#ff5fae}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.hint{font-size:12px;opacity:.55;margin:8px 0 0;line-height:1.5}
+.save{width:100%;padding:16px;border:none;border-radius:16px;font-size:17px;font-weight:700;color:#fff;background:linear-gradient(135deg,#ff5fae,#7a5cff);box-shadow:0 10px 28px #ff5fae44;margin-top:4px}
+</style></head><body><div class="w">
+<div class="face"><span class="eye"></span><span class="eye"></span></div>
+<h1>SHURI</h1><p class="sub">Help me get online &#9829;</p>
+<form method="POST" action="/save">
+<div class="card"><h2>1 &middot; Pick your Wi-Fi</h2>
+<div id="nets" class="nets">Scanning...</div>
+<button type="button" class="link" onclick="scan(1)">&#8635; Scan again</button>
+<label>Wi-Fi name</label><input id="ssid" name="ssid" maxlength="32" required autocomplete="off" autocapitalize="none">
+<label>Password</label><div class="pw"><input id="pass" name="pass" type="password" maxlength="64" autocomplete="off"><button type="button" onclick="tg()">show</button></div>
+<p class="hint">2.4 GHz networks only. Your phone's hotspot works too.</p></div>
+<div class="card"><h2>2 &middot; Your place (for weather)</h2>
+<label>City or town</label><input name="city" maxlength="23" placeholder="e.g. Karaikudi" autocomplete="off">
+<p class="hint">If you leave this empty, Shuri guesses from your internet connection (or keeps the place she already has). That guess is often a different city, so typing your town is better. You can change it later from Shuri's phone page.</p></div>
+<button class="save">Save &amp; Connect &#9829;</button>
+</form></div>
+<script>
+var E=function(i){return document.getElementById(i)};
+function tg(){var p=E('pass');p.type=p.type=='password'?'text':'password'}
+function scan(r){var n=E('nets');n.textContent='Scanning...';
+fetch('/networks'+(r?'?rescan=1':'')).then(function(x){return x.json()}).then(function(l){
+var seen={};l.sort(function(a,b){return b.rssi-a.rssi});n.innerHTML='';
+l.forEach(function(w){if(!w.ssid||seen[w.ssid])return;seen[w.ssid]=1;
+var b=document.createElement('button');b.type='button';b.className='net';
+var s=document.createElement('span');s.textContent=w.ssid+(w.lock?' 🔒':'');
+var q=document.createElement('small');q.textContent=w.rssi>-60?'▂▄▆█':w.rssi>-70?'▂▄▆':w.rssi>-80?'▂▄':'▂';
+b.appendChild(s);b.appendChild(q);
+b.onclick=function(){var o=n.querySelectorAll('.sel');for(var i=0;i<o.length;i++)o[i].classList.remove('sel');b.classList.add('sel');E('ssid').value=w.ssid;E('pass').focus()};
+n.appendChild(b)});
+if(!n.children.length)n.textContent='No networks found. Type the name below.'
+}).catch(function(){n.textContent='Could not scan. Type the name below.'})}
+scan(0);
+</script></body></html>)rawliteral";
+
+
+const char PAGE_DASH[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shuri</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;min-height:100vh;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#fff;padding:18px;
+background:radial-gradient(circle at 12% 8%,#ff5fae55,transparent 45%),radial-gradient(circle at 90% 92%,#7a5cff55,transparent 45%),#150b24;display:flex;justify-content:center}
+.w{width:100%;max-width:440px}
+.top{display:flex;align-items:center;justify-content:space-between;margin:4px 2px 14px}
+h1{margin:0;letter-spacing:8px;font-size:28px}
+.pill{font-size:13px;padding:6px 12px;border-radius:99px;background:#ffffff16;border:1px solid #ffffff22}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#4ade80;margin-right:6px}
+.off .dot{background:#f87171}
+.card{background:#ffffff12;border:1px solid #ffffff22;border-radius:20px;padding:18px;margin-bottom:14px}
+.mood{text-align:center;font-size:56px;line-height:1;margin:2px 0 6px}
+.ml{text-align:center;opacity:.7;font-size:14px;text-transform:capitalize}
+.time{font-size:44px;font-weight:700;text-align:center;letter-spacing:1px}
+.date{text-align:center;opacity:.6;font-size:14px;margin-top:2px}
+.wx{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:14px;padding-top:14px;border-top:1px solid #ffffff1a}
+.temp{font-size:30px;font-weight:700}
+.wd{font-size:13px;opacity:.7;line-height:1.5}
+h2{font-size:14px;margin:0 0 12px;color:#ff9fd0;font-weight:600}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.b{border:none;border-radius:16px;padding:16px 8px;font-size:16px;font-weight:600;color:#fff;background:#ffffff14;border:1px solid #ffffff22;display:flex;flex-direction:column;align-items:center;gap:6px}
+.b span{font-size:30px}
+.b:active{transform:scale(.96);background:#ff5fae40}
+.wide{grid-column:span 2;flex-direction:row;justify-content:center}
+.wide span{font-size:22px}
+.foot{text-align:center;font-size:12px;opacity:.5;margin-top:6px}
+.link{background:none;border:none;color:#ff9fd0;font-size:13px;padding:10px}
+input{width:100%;padding:13px;border-radius:12px;border:1px solid #ffffff26;background:#0006;color:#fff;font-size:16px;outline:none}
+input:focus{border-color:#ff7ac0}
+.sr{display:flex;gap:8px}.sr button{border:none;border-radius:12px;background:#ff5fae;color:#fff;padding:0 16px;font-weight:600;font-size:15px}
+.res{display:flex;flex-direction:column;gap:6px;margin:10px 0 0}
+.net{padding:11px 13px;border-radius:12px;border:1px solid #ffffff1c;background:#ffffff0d;color:#fff;font-size:15px;text-align:left}
+.net:active{background:#ff5fae40}
+.net small{display:block;opacity:.6;font-size:12px;margin-top:2px}
+.hint{font-size:13px;opacity:.75;margin:8px 0;line-height:1.5}
+.lp{font-size:20px;font-weight:700;margin-bottom:6px}
+.gb{width:100%;margin-top:10px;padding:13px;border-radius:14px;border:1px solid #ffffff22;background:#ffffff14;color:#fff;font-size:15px;font-weight:600}
+.lm{font-size:14px;margin:10px 0 0;line-height:1.5;color:#ffd0e8;min-height:20px}
+</style></head><body><div class="w">
+<div class="top"><h1>SHURI</h1><div id="st" class="pill"><i class="dot"></i><b id="stt">online</b></div></div>
+<div class="card"><div id="me" class="mood">&#128578;</div><div id="ml" class="ml">normal</div></div>
+<div class="card"><div id="tm" class="time">--:--</div><div id="dt" class="date">&nbsp;</div>
+<div class="wx"><div id="tp" class="temp">--&deg;</div><div class="wd"><div id="wc">Weather loading...</div><div id="wh">&nbsp;</div></div></div></div>
+<div class="card"><h2>Make Shuri feel...</h2><div class="grid">
+<button class="b" onclick="act('normal')"><span>&#128578;</span>Normal smile</button>
+<button class="b" onclick="act('happy')"><span>&#128516;</span>Very happy</button>
+<button class="b" onclick="act('sad')"><span>&#128546;</span>Sad</button>
+<button class="b" onclick="act('angry')"><span>&#128544;</span>Angry</button>
+<button class="b wide" onclick="act('info')"><span>&#128336;</span>Time &amp; Weather</button>
+</div></div>
+<div class="card"><h2>My place (for weather)</h2>
+<div id="lp" class="lp">...</div>
+<div id="lg" class="hint" style="display:none">This is only a rough guess from your internet connection, so it can be the wrong city. Set your real place here:</div>
+<div class="sr"><input id="q" placeholder="Type your town, e.g. Karaikudi" autocomplete="off" enterkeyhint="search"><button onclick="find()">Search</button></div>
+<div id="res" class="res"></div>
+<button class="gb" onclick="gps()">&#128205; Use my phone's location</button>
+<div id="lm" class="lm"></div>
+</div>
+<div class="foot"><span id="ip"></span><br><button class="link" onclick="wifi()">Change Wi-Fi</button></div>
+</div>
+<script>
+var E=function(i){return document.getElementById(i)};
+var FACE={normal:'\uD83D\uDE42',happy:'\uD83D\uDE04',sad:'\uD83D\uDE22',angry:'\uD83D\uDE20'};
+function act(a){fetch('/api/do?a='+a,{method:'POST'}).then(ref).catch(function(){})}
+function wifi(){if(confirm('Open Wi-Fi setup? Shuri will restart and create the "Shuri-Setup" network.'))
+fetch('/api/setup',{method:'POST'}).then(function(){document.body.innerHTML='<p style="padding:30px;text-align:center">Shuri is restarting into setup mode.<br><br>Join the <b>Shuri-Setup</b> Wi-Fi (password 12345678).</p>'})}
+function ref(){fetch('/api/status').then(function(r){return r.json()}).then(function(s){
+E('st').className='pill';E('stt').textContent='online';
+E('me').textContent=FACE[s.mood]||FACE.normal;E('ml').textContent=s.screen=='eyes'?s.mood:'showing '+s.screen;
+E('tm').textContent=s.synced?s.time:'--:--';E('dt').textContent=s.synced?s.date:'time not synced yet';
+if(s.wx){E('tp').innerHTML=Math.round(s.temp)+'&deg;C';E('wc').textContent=s.cond+(s.city?' · '+s.city:'');
+E('wh').textContent='Humidity '+Math.round(s.hum)+'% · Wind '+Math.round(s.wind)+' km/h'}
+E('ip').textContent='Wi-Fi: '+s.ssid+' \u00B7 '+s.ip+' \u00B7 signal '+s.rssi+' dBm';
+E('lp').textContent=s.place+(s.guess?' (rough guess)':'');E('lg').style.display=s.guess?'block':'none'
+}).catch(function(){E('st').className='pill off';E('stt').textContent='offline'})}
+function say(t){E('lm').textContent=t}
+function setloc(la,lo,n){say('Saving...');
+fetch('/api/setloc?lat='+la+'&lon='+lo+'&name='+encodeURIComponent(n),{method:'POST'}).then(function(r){return r.json()}).then(function(j){
+if(j.ok){say('Saved. The weather will update in a few seconds.');E('res').innerHTML='';E('q').value='';ref()}else say('Shuri could not use that place.')
+}).catch(function(){say('Could not reach Shuri.')})}
+function show(l){var r=E('res');r.innerHTML='';
+if(!l.length){say('No place found. Check the spelling, or try the nearest bigger town.');return}
+say('Tap your place:');
+l.forEach(function(p){var b=document.createElement('button');b.className='net';b.textContent=p.name;
+if(p.area){var a=document.createElement('small');a.textContent=p.area;b.appendChild(a)}
+b.onclick=function(){setloc(p.lat,p.lon,p.name)};r.appendChild(b)})}
+function find(){var q=E('q').value.trim();
+if(q.length<2){say('Type at least 2 letters.');return}
+var m=q.match(/^(-?\d+(\.\d+)?)\s*[, ]\s*(-?\d+(\.\d+)?)$/);
+if(m){setloc(m[1],m[3],'');return}
+say('Searching...');E('res').innerHTML='';
+fetch('https://geocoding-api.open-meteo.com/v1/search?count=6&language=en&format=json&name='+encodeURIComponent(q))
+.then(function(r){return r.json()}).then(function(d){
+show((d.results||[]).map(function(p){return{name:p.name,area:[p.admin2,p.admin1,p.country].filter(Boolean).join(', '),lat:p.latitude,lon:p.longitude}}))})
+.catch(function(){fetch('/api/findcity?q='+encodeURIComponent(q)).then(function(r){return r.json()}).then(show)
+.catch(function(){say('Search failed. Check that the internet is working.')})})}
+function nogps(){say(window.isSecureContext?'Location permission was refused. Allow it in your browser settings, or type your town above.':"Your browser will not share GPS with Shuri's page, because it is not an https page. Type your town in the box above instead.")}
+function gps(){say('Turn on your mobile location (GPS), then tap Allow.');
+fetch('/api/do?a=askloc',{method:'POST'}).catch(function(){});
+if(!navigator.geolocation){nogps();return}
+navigator.geolocation.getCurrentPosition(function(p){setloc(p.coords.latitude.toFixed(4),p.coords.longitude.toFixed(4),'')},
+function(e){if(e.code==1)nogps();else say('No GPS fix yet. Turn on your mobile location and try again, or type your town above.')},
+{enableHighAccuracy:true,timeout:20000,maximumAge:60000})}
+E('q').addEventListener('keydown',function(e){if(e.key=='Enter')find()});
+setInterval(ref,2000);ref();
+</script></body></html>)rawliteral";
+
+
+// ============================================================
+// WEB HANDLERS - SETUP PORTAL
+// ============================================================
+
+void doScan() {
+  Serial.println(F("Scanning Wi-Fi..."));
+  scanCount = WiFi.scanNetworks();
+  if (scanCount < 0) scanCount = 0;
+  Serial.print(scanCount);
+  Serial.println(F(" networks found."));
+}
+
+void handlePortalRoot() {
+  portalLastActivity = millis();
+  server.send_P(200, "text/html; charset=utf-8", PAGE_SETUP);
+}
+
+void handleNetworks() {
+  portalLastActivity = millis();
+  if (server.hasArg("rescan") || scanCount < 0) doScan();
+
+  String json = "[";
+  for (int i = 0; i < scanCount; i++) {
+    if (i) json += ',';
+    json += F("{\"ssid\":\"");
+    json += jsonEscape(WiFi.SSID(i));
+    json += F("\",\"rssi\":");
+    json += WiFi.RSSI(i);
+    json += F(",\"lock\":");
+    json += (WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "false" : "true";
+    json += '}';
+  }
+  json += ']';
+
+  server.send(200, "application/json", json);
+}
+
+void handleSave() {
+  portalLastActivity = millis();
+
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  ssid.trim();
+
+  if (ssid.length() == 0 || ssid.length() > 32 || pass.length() > 64) {
+    server.send(400, "text/html; charset=utf-8",
+                F("<p style='font-family:sans-serif;padding:30px'>Please check the Wi-Fi name and password. <a href='/'>Back</a></p>"));
+    return;
+  }
+
+  memset(cfg.ssid, 0, sizeof(cfg.ssid));
+  memset(cfg.pass, 0, sizeof(cfg.pass));
+  ssid.toCharArray(cfg.ssid, sizeof(cfg.ssid));
+  pass.toCharArray(cfg.pass, sizeof(cfg.pass));
+
+  // Place for the weather: a town name is looked up once Shuri is online
+  String city = server.arg("city");
+  city.trim();
+
+  if (city.length()) {
+    cfg.autoLocation = 2;                 // 2 = look this name up
+    memset(cfg.city, 0, sizeof(cfg.city));
+    city.toCharArray(cfg.city, sizeof(cfg.city));
+  } else if (!cfgValid) {
+    cfg.autoLocation = 1;                 // 1 = rough guess from the internet
+  }                                       // otherwise keep the saved place
+
+  saveConfig();
+
+  String page = F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1'></head>"
+                  "<body style='margin:0;font-family:system-ui,sans-serif;background:#150b24;color:#fff;"
+                  "text-align:center;padding:40px 22px'>"
+                  "<h1 style='letter-spacing:8px'>SHURI</h1>"
+                  "<p style='font-size:40px;margin:10px'>&#9829;</p>"
+                  "<p>Saved! I'm restarting and joining <b>");
+  page += htmlEscape(ssid);
+  page += F("</b>.</p><p style='opacity:.7;line-height:1.6'>Now connect your phone back to that same Wi-Fi.<br>"
+            "My screen will show my address (like 192.168.1.23).<br>Open it in your browser to play with me.</p>"
+            "</body></html>");
+
+  server.send(200, "text/html; charset=utf-8", page);
+
+  showMessage("Saved!", "Joining Wi-Fi:", fitText(ssid, 21), "restarting...", 5000);
+  restartAt = millis() + 2000;
+}
+
+void handlePortalRedirect() {
+  portalLastActivity = millis();
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+
+// ============================================================
+// WEB HANDLERS - DASHBOARD
+// ============================================================
+
+void handleDashRoot() {
+  server.send_P(200, "text/html; charset=utf-8", PAGE_DASH);
+}
+
+void handleStatus() {
+  String j;
+  j.reserve(560);
+
+  j += F("{\"mood\":\"");
+  j += moodName(mood);
+  j += F("\",\"screen\":\"");
+  j += screenName(screen);
+  j += '"';
+
+  struct tm t;
+  bool synced = getTimeNow(t);
+  j += F(",\"synced\":");
+  j += synced ? "true" : "false";
+
+  if (synced) {
+    int h12 = t.tm_hour % 12;
+    if (h12 == 0) h12 = 12;
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%d:%02d %s", h12, t.tm_min, t.tm_hour < 12 ? "AM" : "PM");
+    j += F(",\"time\":\"");
+    j += buf;
+    snprintf(buf, sizeof(buf), "%s, %d %s %d", DAY_NAMES[t.tm_wday], t.tm_mday,
+             MONTH_NAMES[t.tm_mon], t.tm_year + 1900);
+    j += F("\",\"date\":\"");
+    j += buf;
+    j += '"';
+  }
+
+  j += F(",\"wx\":");
+  j += weatherOk ? "true" : "false";
+  if (weatherOk) {
+    j += F(",\"temp\":");  j += String(wxTemp, 1);
+    j += F(",\"hum\":");   j += String(wxHum, 0);
+    j += F(",\"wind\":");  j += String(wxWind, 1);
+    j += F(",\"cond\":\""); j += weatherText(wxCode);
+    j += F("\",\"city\":\""); j += jsonEscape(cityName);
+    j += '"';
+  }
+
+  j += F(",\"place\":\"");
+  j += jsonEscape(placeText());
+  j += F("\",\"guess\":");
+  j += (cfg.autoLocation != 0) ? "true" : "false";
+
+  j += F(",\"ssid\":\"");
+  j += jsonEscape(WiFi.SSID());
+  j += F("\",\"ip\":\"");
+  j += ipString();
+  j += F("\",\"rssi\":");
+  j += WiFi.RSSI();
+  j += '}';
+
+  server.send(200, "application/json", j);
+}
+
+void handleDo() {
+  String a = server.arg("a");
+
+  if (a == "happy")        setMood(MOOD_HAPPY);
+  else if (a == "sad")     setMood(MOOD_SAD);
+  else if (a == "angry")   setMood(MOOD_ANGRY);
+  else if (a == "normal")  setMood(MOOD_NORMAL);
+  else if (a == "info" || a == "time") openInfo();
+  else if (a == "weather") openWeather();
+  else if (a == "askloc") {
+    // the phone page is asking the phone for its GPS position
+    showMessage("LOCATION", "Turn on your", "mobile location", "(GPS) on your phone", 8000);
+  }
+  else {
+    server.send(400, "application/json", F("{\"ok\":false}"));
+    return;
+  }
+
+  boopStart = millis();
+  server.send(200, "application/json", F("{\"ok\":true}"));
+}
+
+// The exact place for the weather. Saved, and used until it is changed.
+void setLocation(float la, float lo, const String& name, bool announce) {
+  wxLat = la;
+  wxLon = lo;
+  cityName = name;
+
+  cfg.autoLocation = 0;                   // 0 = fixed place
+  cfg.lat = la;
+  cfg.lon = lo;
+  memset(cfg.city, 0, sizeof(cfg.city));
+  name.toCharArray(cfg.city, sizeof(cfg.city));
+  saveConfig();
+
+  weatherOk = false;                      // old reading was for another place
+  nextWeatherAt = millis();
+
+  Serial.print(F("Location set: "));
+  Serial.println(placeText());
+
+  if (announce) showMessage("Location", "Saved:", fitText(placeText(), 21), "", 4000);
+}
+
+// POST /api/setloc?lat=..&lon=..&name=..
+void handleSetLoc() {
+  String latS = server.arg("lat");
+  String lonS = server.arg("lon");
+  String name = server.arg("name");
+  name.trim();
+
+  float la = latS.toFloat();
+  float lo = lonS.toFloat();
+
+  bool ok = latS.length() && lonS.length() &&
+            la >= -90 && la <= 90 && lo >= -180 && lo <= 180;
+
+  if (!ok) {
+    server.send(400, "application/json", F("{\"ok\":false}"));
+    return;
+  }
+
+  setLocation(la, lo, name, true);
+  server.send(200, "application/json", F("{\"ok\":true}"));
+}
+
+// GET /api/findcity?q=..  (used when the phone cannot search by itself)
+void handleFindCity() {
+  String q = server.arg("q");
+  q.trim();
+
+  float la, lo;
+  String name, list = "[]";
+
+  if (wifiUp && q.length() >= 2) findPlace(q, 5, la, lo, name, list);
+
+  server.send(200, "application/json", list);
+}
+
+void handleSetupRequest() {
+  server.send(200, "application/json", F("{\"ok\":true}"));
+  requestPortal();
+}
+
+
+// ============================================================
+// WI-FI
+// ============================================================
+
+String ipString() {
+  return WiFi.localIP().toString();
+}
+
+void startPortal() {
+  portalMode = true;
+  screen = SCR_PORTAL;
+
+  Serial.println();
+  Serial.println(F("==== SHURI SETUP MODE ===="));
+
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(AP_NAME, AP_PASS);
+
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(53, "*", AP_IP);
+
+  drawPortalPage();
+  display.display();
+  doScan();
+
+  server.on("/", HTTP_GET, handlePortalRoot);
+  server.on("/networks", HTTP_GET, handleNetworks);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound(handlePortalRedirect);   // captive portal pop-up
+  server.begin();
+
+  portalLastActivity = millis();
+
+  Serial.print(F("AP: "));
+  Serial.print(AP_NAME);
+  Serial.print(F("  pass: "));
+  Serial.println(AP_PASS);
+  Serial.println(F("Open http://192.168.4.1"));
+}
+
+bool connectAtBoot() {
+  Serial.print(F("Connecting to "));
+  Serial.println(cfg.ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(HOST_NAME);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(cfg.ssid, cfg.pass);
+
+  unsigned long start = millis();
+  lookOverride = true;
+  showMouth = false;          // the bottom line shows the Wi-Fi name
+  wakeStart = start;
+
+  String label = fitText(String("Finding ") + cfg.ssid, 21);
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_BOOT_TIMEOUT_MS) {
+    unsigned long now = millis();
+
+    // eyes look left and right while searching
+    lookTX = sinf(now * 0.0025f);
+    lookTY = -0.3f;
+    renderEyes(now);
+
+    display.fillRect(0, 55, SCREEN_W, 9, C_OFF);
+    display.setTextColor(C_ON);
+    drawCenteredText(label, 1, 56);
+    display.display();
+
+    delay(30);
+  }
+
+  lookOverride = false;
+  showMouth = true;
+  lookTX = 0;
+  lookTY = 0;
+  lastWiFiKick = millis();
+
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void onWiFiUp() {
+  Serial.print(F("Wi-Fi connected. IP: "));
+  Serial.println(ipString());
+
+  if (!mdnsStarted && MDNS.begin(HOST_NAME)) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsStarted = true;
+    Serial.println(F("mDNS: http://shuri.local"));
+  }
+
+  configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com");
+
+  locationPending = true;
+  nextWeatherAt = millis();
+
+  if (!everConnected) {
+    showMessage("Hi! I'm on", "Open on your phone:", "http://" + ipString(), "or shuri.local", 8000);
+  }
+  everConnected = true;
+}
+
+void handleWiFi() {
+  bool up = WiFi.status() == WL_CONNECTED;
+
+  if (up && !wifiUp) {
+    wifiUp = true;
+    onWiFiUp();
+  } else if (!up && wifiUp) {
+    wifiUp = false;
+    lastWiFiKick = millis();
+    Serial.println(F("Wi-Fi lost. Retrying in the background."));
+  }
+
+  // The ESP retries by itself; give it a fresh start once a minute
+  if (!up && cfgValid && millis() - lastWiFiKick >= WIFI_RETRY_MS) {
+    lastWiFiKick = millis();
+    Serial.println(F("Retrying Wi-Fi..."));
+    WiFi.begin(cfg.ssid, cfg.pass);
+  }
+}
+
+// Network calls block for a moment, so only do them when Shuri is calm
+bool isCalm() {
+  return screen == SCR_EYES && mood == MOOD_NORMAL &&
+         !touchState && tapCount == 0;
+}
+
+void handleNetTasks() {
+  if (!wifiUp) return;
+  if (!isCalm() && screen != SCR_MESSAGE) return;
+
+  if (locationPending) {
+    locationPending = false;
+    fetchLocation();
+
+    // A town name typed on the Wi-Fi setup page: look it up now
+    if (cfg.autoLocation == 2) {
+      float la, lo;
+      String name, list;
+      if (findPlace(cfg.city, 1, la, lo, name, list) > 0) {
+        setLocation(la, lo, name, false);
+      } else {
+        Serial.println(F("Town not found yet. Using the internet guess."));
+      }
+    }
+    return;
+  }
+
+  if (timeReached(nextWeatherAt)) {
+    updateWeather();
+  }
+}
+
+
+// ============================================================
+// LOCATION (ip-api.com, no key needed)
+// ============================================================
+
+void fetchLocation() {
+  Serial.println(F("Finding location..."));
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(5000);
+
+  if (!http.begin(client, "http://ip-api.com/json/?fields=status,city,lat,lon,offset")) {
+    Serial.println(F("Location: begin failed"));
+    return;
+  }
+
+  int code = http.GET();
+
+  if (code == HTTP_CODE_OK) {
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
+    DynamicJsonDocument doc(512);
+#endif
+    DeserializationError err = deserializeJson(doc, http.getStream());
+
+    if (!err && String((const char*)(doc["status"] | "")) == "success") {
+      long off = doc["offset"] | 19800L;
+      if (off != utcOffsetSec) {
+        utcOffsetSec = off;
+        configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com");
+      }
+
+      if (cfg.autoLocation) {
+        wxLat = doc["lat"] | wxLat;
+        wxLon = doc["lon"] | wxLon;
+        cityName = (const char*)(doc["city"] | "");
+      }
+
+      Serial.print(F("Location: "));
+      Serial.print(cityName);
+      Serial.print(F("  "));
+      Serial.print(wxLat, 4);
+      Serial.print(F(", "));
+      Serial.print(wxLon, 4);
+      Serial.print(F("  UTC offset "));
+      Serial.println(utcOffsetSec);
+    } else {
+      Serial.println(F("Location: bad reply"));
+    }
+  } else {
+    Serial.print(F("Location HTTP error: "));
+    Serial.println(code);
+  }
+
+  http.end();
+}
+
+
+// ============================================================
+// PLACE SEARCH (open-meteo.com geocoding, no key needed)
+// ============================================================
+
+String urlEncode(const String& text) {
+  String out;
+  char buf[4];
+
+  for (unsigned int i = 0; i < text.length(); i++) {
+    uint8_t c = (uint8_t)text[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += (char)c;
+    } else {
+      snprintf(buf, sizeof(buf), "%%%02X", c);
+      out += buf;
+    }
+  }
+
+  return out;
+}
+
+// Looks a town name up. Fills the best match (lat, lon, name) and a small
+// JSON list of all matches. Returns how many were found, -1 if no answer.
+int findPlace(const String& query, int count, float& lat, float& lon,
+              String& name, String& listJson) {
+  String url = String(F("https://geocoding-api.open-meteo.com/v1/search?language=en&format=json&count=")) +
+               String(count) + F("&name=") + urlEncode(query);
+
+  Serial.print(F("Looking up place: "));
+  Serial.println(query);
+
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure();   // public place names only, no secrets
+
+  HTTPClient http;
+  http.useHTTP10(true);   // plain reply that can be read piece by piece
+  http.setTimeout(8000);
+
+  int found = -1;
+  listJson = "[";
+
+  if (http.begin(client, url)) {
+    int code = http.GET();
+
+    if (code == HTTP_CODE_OK) {
+      // Keep only the few fields we need (the full reply can be large)
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+      JsonDocument filter;
+      JsonDocument doc;
+#else
+      StaticJsonDocument<256> filter;
+      DynamicJsonDocument doc(2048);
+#endif
+      filter["results"][0]["name"] = true;
+      filter["results"][0]["latitude"] = true;
+      filter["results"][0]["longitude"] = true;
+      filter["results"][0]["admin1"] = true;
+      filter["results"][0]["country"] = true;
+
+      DeserializationError err = deserializeJson(doc, http.getStream(),
+                                                 DeserializationOption::Filter(filter));
+
+      if (!err) {
+        found = 0;
+
+        for (JsonObject r : doc["results"].as<JsonArray>()) {
+          const char* n = r["name"] | "";
+          if (!n[0]) continue;
+
+          float la = r["latitude"] | 0.0f;
+          float lo = r["longitude"] | 0.0f;
+
+          String area = (const char*)(r["admin1"] | "");
+          const char* country = r["country"] | "";
+          if (country[0]) {
+            if (area.length()) area += ", ";
+            area += country;
+          }
+
+          if (found == 0) {
+            lat = la;
+            lon = lo;
+            name = n;
+          } else {
+            listJson += ',';
+          }
+
+          listJson += F("{\"name\":\"");
+          listJson += jsonEscape(n);
+          listJson += F("\",\"area\":\"");
+          listJson += jsonEscape(area);
+          listJson += F("\",\"lat\":");
+          listJson += String(la, 4);
+          listJson += F(",\"lon\":");
+          listJson += String(lo, 4);
+          listJson += '}';
+
+          found++;
+        }
+      } else {
+        Serial.println(F("Place search: could not read the reply"));
+      }
+    } else {
+      Serial.print(F("Place search HTTP error: "));
+      Serial.println(code);
+    }
+
+    http.end();
+  }
+
+  listJson += ']';
+
+  Serial.print(F("Places found: "));
+  Serial.println(found);
+
+  return found;
+}
+
+
+// ============================================================
+// WEATHER (open-meteo.com, no key needed)
+// ============================================================
+
+void updateWeather() {
+  nextWeatherAt = millis() + WEATHER_RETRY_MS;   // if this fails
+
+  String url = String(F("https://api.open-meteo.com/v1/forecast?latitude=")) + String(wxLat, 4) +
+               F("&longitude=") + String(wxLon, 4) +
+               F("&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,is_day");
+
+  Serial.println(F("Getting weather..."));
+
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure();   // weather data only, no secrets
+
+  HTTPClient http;
+  http.setTimeout(8000);
+
+  if (!http.begin(client, url)) {
+    Serial.println(F("Weather: begin failed"));
+    return;
+  }
+
+  int code = http.GET();
+
+  if (code == HTTP_CODE_OK) {
+    String payload = http.getString();
+
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
+    DynamicJsonDocument doc(1536);
+#endif
+    DeserializationError err = deserializeJson(doc, payload);
+
+    if (!err && doc["current"].is<JsonObject>()) {
+      JsonObject cur = doc["current"];
+      wxTemp  = cur["temperature_2m"] | 0.0f;
+      wxHum   = cur["relative_humidity_2m"] | 0.0f;
+      wxWind  = cur["wind_speed_10m"] | 0.0f;
+      wxCode  = cur["weather_code"] | -1;
+      wxIsDay = (cur["is_day"] | 1) == 1;
+
+      weatherOk = true;
+      wxUpdatedAt = millis();
+      nextWeatherAt = millis() + WEATHER_EVERY_MS;
+
+      Serial.print(F("Weather: "));
+      Serial.print(wxTemp, 1);
+      Serial.print(F(" C, "));
+      Serial.print(weatherText(wxCode));
+      Serial.print(F(", humidity "));
+      Serial.println(wxHum, 0);
+    } else {
+      Serial.println(F("Weather: JSON error"));
+    }
+  } else {
+    Serial.print(F("Weather HTTP error: "));
+    Serial.println(code);
+  }
+
+  http.end();
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void showSplash() {
+  display.clearDisplay();
+  display.setTextColor(C_ON);
+  drawCenteredText("SHURI", 3, 14);
+  drawHeart(64, 50);
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println();
+  Serial.println(F("==== SHURI waking up ===="));
+
+  pinMode(TOUCH_PIN, INPUT);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println(F("OLED not found! Check wiring / address 0x3C."));
+    while (true) delay(1000);
+  }
+
+  randomSeed(RANDOM_REG32);
+
+  showSplash();
+  delay(1800);
+
+  WiFi.persistent(false);   // we keep our own copy in EEPROM
+
+  loadConfig();
+  bool forcePortal = takePortalFlag();
+
+  if (!cfgValid || forcePortal) {
+    if (!cfgValid) Serial.println(F("No saved Wi-Fi."));
+    startPortal();
+    return;
+  }
+
+  // Normal mode: web dashboard is always available on the local Wi-Fi
+  server.on("/", HTTP_GET, handleDashRoot);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/do", handleDo);
+  server.on("/api/setloc", HTTP_POST, handleSetLoc);
+  server.on("/api/findcity", HTTP_GET, handleFindCity);
+  server.on("/api/setup", HTTP_POST, handleSetupRequest);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+
+  if (connectAtBoot()) {
+    wifiUp = true;
+    onWiFiUp();
+  } else {
+    Serial.println(F("Wi-Fi not found. Playing offline."));
+    showMessage("Offline", String("Can't find ") + fitText(cfg.ssid, 11),
+                "I'll keep trying :)", "6 taps = menu", 6000);
+  }
+
+  wakeStart = millis();
+  nextBlinkAt = millis() + 1500;
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+  if (restartAt != 0 && timeReached(restartAt)) {
+    ESP.restart();
+  }
+
+  if (portalMode) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+
+    // Saved config exists: hold the sensor 3 s to cancel setup
+    static bool armed = false;
+    static unsigned long heldSince = 0;
+    bool touched = digitalRead(TOUCH_PIN) == TOUCH_ACTIVE;
+
+    if (!touched) { armed = true; heldSince = 0; }
+    else if (armed && cfgValid) {
+      if (heldSince == 0) heldSince = millis();
+      if (millis() - heldSince >= 3000 && restartAt == 0) {
+        showMessage("Bye setup", "Restarting...", "", "", 3000);
+        restartAt = millis() + 800;
+      }
+    }
+
+    // Saved config exists and nobody is using setup: go back to normal
+    if (cfgValid && restartAt == 0 && millis() - portalLastActivity >= PORTAL_IDLE_MS) {
+      restartAt = millis();
+    }
+
+    if (screen == SCR_MESSAGE && timeReached(msgUntil)) screen = SCR_PORTAL;
+    renderScreen();
+    delay(2);
+    return;
+  }
+
+  server.handleClient();
+  if (mdnsStarted) MDNS.update();
+
+  handleWiFi();
+  handleTouch();
+  updateTimers();
+  handleNetTasks();
+  renderScreen();
+
+  delay(1);
+}
